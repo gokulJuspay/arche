@@ -21,6 +21,8 @@ const TOKEN_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const TOKEN_FETCH_MAX_ATTEMPTS: u32 = 2;
 const TOKEN_FETCH_RETRY_DELAY: Duration = Duration::from_millis(200);
 
+pub const DEFAULT_METADATA_BASE_URL: &str = "http://metadata.google.internal";
+
 #[derive(Clone, Deserialize)]
 pub struct ServiceAccountKey {
     client_email: String,
@@ -157,9 +159,14 @@ struct CachedToken {
 
 type CacheKey = (String, Vec<String>);
 
+enum AuthSource {
+    ServiceAccount(ServiceAccountKey),
+    Metadata { base_url: String },
+}
+
 pub struct TokenSource {
     http: reqwest::Client,
-    key: ServiceAccountKey,
+    auth: AuthSource,
     cache: Mutex<HashMap<CacheKey, CachedToken>>,
     locks: Mutex<HashMap<CacheKey, Arc<Mutex<()>>>>,
 }
@@ -168,7 +175,17 @@ impl TokenSource {
     pub fn new(http: reqwest::Client, key: ServiceAccountKey) -> Self {
         Self {
             http,
-            key,
+            auth: AuthSource::ServiceAccount(key),
+            cache: Mutex::new(HashMap::new()),
+            locks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn metadata(http: reqwest::Client, base_url: impl Into<String>) -> Self {
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        Self {
+            http,
+            auth: AuthSource::Metadata { base_url },
             cache: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
         }
@@ -186,7 +203,12 @@ impl TokenSource {
         // Sort so the same scope set in different orders shares a cache slot.
         let mut sorted_scopes: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
         sorted_scopes.sort();
-        let cache_key: CacheKey = (self.key.client_email.clone(), sorted_scopes);
+        let cache_key_id = match &self.auth {
+            AuthSource::ServiceAccount(k) => k.client_email.clone(),
+
+            AuthSource::Metadata { .. } => "metadata".to_string(),
+        };
+        let cache_key: CacheKey = (cache_key_id, sorted_scopes);
 
         if let Some(token) = self.lookup_cached(&cache_key).await {
             return Ok(token);
@@ -220,11 +242,22 @@ impl TokenSource {
     }
 
     async fn fetch_token(&self, scopes: &[&str]) -> Result<CachedToken, AppError> {
-        let assertion = self.sign_assertion(scopes)?;
+        match &self.auth {
+            AuthSource::ServiceAccount(key) => self.fetch_sa_token(key, scopes).await,
+            AuthSource::Metadata { base_url } => self.fetch_metadata_token(base_url).await,
+        }
+    }
+
+    async fn fetch_sa_token(
+        &self,
+        key: &ServiceAccountKey,
+        scopes: &[&str],
+    ) -> Result<CachedToken, AppError> {
+        let assertion = sign_assertion(key, scopes)?;
 
         let mut last_transient: Option<String> = None;
         for attempt in 1..=TOKEN_FETCH_MAX_ATTEMPTS {
-            match self.try_fetch_token(&assertion).await {
+            match self.try_fetch_sa_token(key, &assertion).await {
                 Ok(token) => return Ok(token),
                 Err(TokenFetchError::Permanent(e)) => return Err(e),
                 Err(TokenFetchError::Transient(detail)) => {
@@ -250,40 +283,14 @@ impl TokenSource {
         ))
     }
 
-    fn sign_assertion(&self, scopes: &[&str]) -> Result<String, AppError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| AppError::internal_error(format!("Clock error: {e}"), None))?
-            .as_secs();
-
-        let claims = JwtClaims {
-            iss: &self.key.client_email,
-            scope: scopes.join(" "),
-            aud: self.key.token_uri(),
-            iat: now,
-            exp: now + JWT_LIFETIME_SECS,
-        };
-
-        let mut header = Header::new(Algorithm::RS256);
-        header.kid = self.key.private_key_id.clone();
-
-        let encoding_key =
-            EncodingKey::from_rsa_pem(self.key.private_key.as_bytes()).map_err(|e| {
-                AppError::internal_error(
-                    format!("Invalid GCP service account private key: {e}"),
-                    None,
-                )
-            })?;
-
-        jsonwebtoken::encode(&header, &claims, &encoding_key).map_err(|e| {
-            AppError::internal_error(format!("Failed to sign JWT for GCP token: {e}"), None)
-        })
-    }
-
-    async fn try_fetch_token(&self, assertion: &str) -> Result<CachedToken, TokenFetchError> {
+    async fn try_fetch_sa_token(
+        &self,
+        key: &ServiceAccountKey,
+        assertion: &str,
+    ) -> Result<CachedToken, TokenFetchError> {
         let send_fut = self
             .http
-            .post(self.key.token_uri())
+            .post(key.token_uri())
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
                 ("assertion", assertion),
@@ -333,14 +340,128 @@ impl TokenSource {
             ))
         })?;
 
-        let lifetime = Duration::from_secs(token.expires_in)
-            .checked_sub(EXPIRY_SAFETY_MARGIN)
-            .unwrap_or(Duration::ZERO);
+        Ok(cached_with_safety_margin(token))
+    }
 
-        Ok(CachedToken {
-            value: token.access_token,
-            expires_at: Instant::now() + lifetime,
-        })
+    async fn fetch_metadata_token(&self, base_url: &str) -> Result<CachedToken, AppError> {
+        let url = format!("{base_url}/computeMetadata/v1/instance/service-accounts/default/token");
+
+        let mut last_transient: Option<String> = None;
+        for attempt in 1..=TOKEN_FETCH_MAX_ATTEMPTS {
+            match self.try_fetch_metadata_token(&url).await {
+                Ok(token) => return Ok(token),
+                Err(TokenFetchError::Permanent(e)) => return Err(e),
+                Err(TokenFetchError::Transient(detail)) => {
+                    if attempt < TOKEN_FETCH_MAX_ATTEMPTS {
+                        tracing::warn!(
+                            attempt,
+                            error = %detail,
+                            "Transient GCP metadata-server token fetch error, retrying"
+                        );
+                        tokio::time::sleep(TOKEN_FETCH_RETRY_DELAY).await;
+                    }
+                    last_transient = Some(detail);
+                }
+            }
+        }
+
+        Err(AppError::internal_error(
+            format!(
+                "Failed to fetch metadata-server token after {TOKEN_FETCH_MAX_ATTEMPTS} attempts: {}",
+                last_transient.unwrap_or_else(|| "unknown error".into())
+            ),
+            None,
+        ))
+    }
+
+    async fn try_fetch_metadata_token(&self, url: &str) -> Result<CachedToken, TokenFetchError> {
+        let send_fut = self
+            .http
+            .get(url)
+            .header("Metadata-Flavor", "Google")
+            .send();
+
+        let resp = match tokio::time::timeout(TOKEN_FETCH_TIMEOUT, send_fut).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(TokenFetchError::Transient(format!("send error: {e}"))),
+            Err(_) => {
+                return Err(TokenFetchError::Transient(format!(
+                    "timed out after {}s",
+                    TOKEN_FETCH_TIMEOUT.as_secs()
+                )));
+            }
+        };
+
+        let status = resp.status();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| TokenFetchError::Transient(format!("read body error: {e}")))?;
+
+        if status.is_server_error() {
+            return Err(TokenFetchError::Transient(format!(
+                "metadata server returned HTTP {status}: {}",
+                String::from_utf8_lossy(&body)
+            )));
+        }
+
+        if !status.is_success() {
+            return Err(TokenFetchError::Permanent(AppError::internal_error(
+                format!(
+                    "metadata server returned HTTP {status}: {}",
+                    String::from_utf8_lossy(&body)
+                ),
+                None,
+            )));
+        }
+
+        let token: TokenResponse = serde_json::from_slice(&body).map_err(|e| {
+            TokenFetchError::Permanent(AppError::internal_error(
+                format!("Malformed metadata-server response: {e}"),
+                None,
+            ))
+        })?;
+
+        Ok(cached_with_safety_margin(token))
+    }
+}
+
+fn sign_assertion(key: &ServiceAccountKey, scopes: &[&str]) -> Result<String, AppError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| AppError::internal_error(format!("Clock error: {e}"), None))?
+        .as_secs();
+
+    let claims = JwtClaims {
+        iss: &key.client_email,
+        scope: scopes.join(" "),
+        aud: key.token_uri(),
+        iat: now,
+        exp: now + JWT_LIFETIME_SECS,
+    };
+
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = key.private_key_id.clone();
+
+    let encoding_key = EncodingKey::from_rsa_pem(key.private_key.as_bytes()).map_err(|e| {
+        AppError::internal_error(
+            format!("Invalid GCP service account private key: {e}"),
+            None,
+        )
+    })?;
+
+    jsonwebtoken::encode(&header, &claims, &encoding_key).map_err(|e| {
+        AppError::internal_error(format!("Failed to sign JWT for GCP token: {e}"), None)
+    })
+}
+
+fn cached_with_safety_margin(token: TokenResponse) -> CachedToken {
+    let lifetime = Duration::from_secs(token.expires_in)
+        .checked_sub(EXPIRY_SAFETY_MARGIN)
+        .unwrap_or(Duration::ZERO);
+    CachedToken {
+        value: token.access_token,
+        expires_at: Instant::now() + lifetime,
     }
 }
 
